@@ -1,0 +1,519 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Firebase FPS (Three.js)</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #111; font-family: 'Segoe UI', sans-serif; }
+        
+        /* UI OVERLAY */
+        #ui { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; user-select: none; }
+        
+        /* START SCREEN */
+        #start-screen { 
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%; 
+            background: rgba(0,0,0,0.85); display: flex; flex-direction: column; 
+            align-items: center; justify-content: center; color: white; pointer-events: auto; z-index: 10;
+        }
+        button { 
+            padding: 15px 40px; font-size: 24px; cursor: pointer; 
+            background: #ff4400; color: white; border: none; font-weight: bold; 
+            text-transform: uppercase; letter-spacing: 2px;
+        }
+        button:hover { background: #ff6600; }
+
+        /* HUD */
+        #hud { display: none; }
+        #crosshair { 
+            position: absolute; top: 50%; left: 50%; width: 6px; height: 6px; 
+            background: #00ff00; border-radius: 50%; transform: translate(-50%, -50%);
+            box-shadow: 0 0 4px #00ff00;
+        }
+        #health-container { 
+            position: absolute; bottom: 30px; left: 30px; width: 300px; height: 30px; 
+            background: #333; border: 2px solid #555; 
+        }
+        #health-bar { width: 100%; height: 100%; background: #00ff00; transition: width 0.2s, background 0.2s; }
+        #killfeed { position: absolute; top: 20px; right: 20px; text-align: right; color: white; font-size: 14px; }
+        .feed-msg { margin-bottom: 5px; opacity: 1; transition: opacity 1s; }
+    </style>
+
+    <!-- Import Maps Polyfill -->
+    <script async src="https://unpkg.com/es-module-shims@1.6.3/dist/es-module-shims.js"></script>
+
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+          "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+          "firebase/app": "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js",
+          "firebase/database": "https://www.gstatic.com/firebasejs/10.7.1/firebase-database.js",
+          "firebase/auth": "https://www.gstatic.com/firebasejs/10.7.1/firebase-auth.js"
+        }
+      }
+    </script>
+</head>
+<body>
+
+    <div id="ui">
+        <div id="start-screen">
+            <h1 style="font-size: 60px; margin-bottom: 10px;">FIREBASE FPS</h1>
+            <p style="color: #aaa; margin-bottom: 40px;">WASD to Move | Click to Shoot</p>
+            <input type="text" id="username" placeholder="Enter Name" style="padding: 10px; font-size: 18px; text-align: center; margin-bottom: 20px;">
+            <button id="btn-play">JOIN BATTLE</button>
+        </div>
+
+        <div id="hud">
+            <div id="crosshair"></div>
+            <div id="health-container"><div id="health-bar"></div></div>
+            <div id="killfeed"></div>
+        </div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
+        import { initializeApp } from 'firebase/app';
+        import { getDatabase, ref, set, onChildAdded, onChildChanged, onChildRemoved, onDisconnect, remove, update } from 'firebase/database';
+        import { getAuth, signInAnonymously } from 'firebase/auth';
+
+        // --- 1. FIREBASE CONFIGURATION ---
+        const firebaseConfig = {
+            apiKey: "AIzaSyABPkMXhTvggyldLkbrj_KgqKi9k9HGV8U",
+            authDomain: "cosmo-chat-ba2b8.firebaseapp.com",
+            databaseURL: "https://cosmo-chat-ba2b8-default-rtdb.firebaseio.com",
+            projectId: "cosmo-chat-ba2b8",
+            storageBucket: "cosmo-chat-ba2b8.firebasestorage.app",
+            messagingSenderId: "708743540698",
+            appId: "1:708743540698:web:bcc69ea333df38ae2f9ae3"
+        };
+
+        const app = initializeApp(firebaseConfig);
+        const db = getDatabase(app);
+        const auth = getAuth(app);
+
+        // Constants
+        const ROOM_ID = "lobby_v1"; 
+        const UPDATE_RATE = 50; // Send data every 50ms (20 ticks/sec)
+
+        // Game State
+        let myId = null;
+        let myName = "Unknown";
+        let myHealth = 100;
+        let players = {}; // Stores other player Meshes and data
+        let lastUpdateTime = 0;
+
+        // Three.js Globals
+        let scene, camera, renderer, controls;
+        const moveState = { fwd: false, bwd: false, left: false, right: false };
+        const velocity = new THREE.Vector3();
+        const direction = new THREE.Vector3();
+
+        // --- 2. INITIALIZATION ---
+
+        document.getElementById('btn-play').addEventListener('click', async () => {
+            const nameInput = document.getElementById('username').value;
+            myName = nameInput || `Soldier${Math.floor(Math.random()*1000)}`;
+            
+            // Login Anonymously
+            try {
+                const userCred = await signInAnonymously(auth);
+                myId = userCred.user.uid;
+                
+                initGame();
+                
+                // Hide Menu
+                document.getElementById('start-screen').style.display = 'none';
+                document.getElementById('hud').style.display = 'block';
+                
+                // Lock Cursor
+                controls.lock();
+            } catch (error) {
+                console.error("Auth Failed", error);
+                alert("Could not connect to Firebase. Check console.");
+            }
+        });
+
+        function initGame() {
+            // Scene Setup
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x1a1a1a);
+            scene.fog = new THREE.Fog(0x1a1a1a, 0, 80);
+
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth/window.innerHeight, 0.1, 1000);
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.shadowMap.enabled = true;
+            document.body.appendChild(renderer.domElement);
+
+            // Lighting
+            const ambient = new THREE.AmbientLight(0xffffff, 0.4);
+            scene.add(ambient);
+            const dirLight = new THREE.DirectionalLight(0xffffff, 0.7);
+            dirLight.position.set(20, 40, 20);
+            dirLight.castShadow = true;
+            scene.add(dirLight);
+
+            // Map
+            createMap();
+
+            // Controls
+            controls = new PointerLockControls(camera, document.body);
+            
+            // Input Listeners
+            document.addEventListener('keydown', (e) => onKey(e, true));
+            document.addEventListener('keyup', (e) => onKey(e, false));
+            document.addEventListener('click', () => {
+                if(controls.isLocked) shoot();
+                else controls.lock();
+            });
+
+            // Initial Spawn
+            respawn();
+
+            // Setup Network Listeners
+            setupFirebaseListeners();
+
+            // Start Loop
+            animate();
+        }
+
+        // --- 3. MAP GENERATION ---
+        function createMap() {
+            // Floor
+            const floorGeo = new THREE.PlaneGeometry(200, 200);
+            const floorMat = new THREE.MeshStandardMaterial({ color: 0x222222, roughness: 0.8 });
+            const floor = new THREE.Mesh(floorGeo, floorMat);
+            floor.rotation.x = -Math.PI / 2;
+            floor.receiveShadow = true;
+            scene.add(floor);
+
+            // Grid Texture Helper
+            const gridHelper = new THREE.GridHelper(200, 50, 0x444444, 0x333333);
+            scene.add(gridHelper);
+
+            // Random Cover
+            const boxGeo = new THREE.BoxGeometry(5, 5, 5);
+            const boxMat = new THREE.MeshStandardMaterial({ color: 0x445566 });
+            
+            // Deterministic "random" seed logic or hardcoded positions preferred for sync
+            // For this demo, we generate fixed positions
+            const positions = [
+                {x: 10, z: 10}, {x: -15, z: -20}, {x: 30, z: -5}, 
+                {x: -30, z: 30}, {x: 0, z: 40}, {x: 20, z: -30}
+            ];
+
+            positions.forEach(pos => {
+                const box = new THREE.Mesh(boxGeo, boxMat);
+                box.position.set(pos.x, 2.5, pos.z);
+                box.castShadow = true;
+                box.receiveShadow = true;
+                scene.add(box);
+            });
+        }
+
+        // --- 4. PLAYER & NETWORK LOGIC ---
+
+        function setupFirebaseListeners() {
+            const playersRef = ref(db, `games/${ROOM_ID}/players`);
+
+            // 1. Remove myself if I disconnect (close tab)
+            const myRef = ref(db, `games/${ROOM_ID}/players/${myId}`);
+            onDisconnect(myRef).remove();
+
+            // 2. Listen for new players
+            onChildAdded(playersRef, (snapshot) => {
+                const id = snapshot.key;
+                const data = snapshot.val();
+                if (id !== myId) createRemotePlayer(id, data);
+            });
+
+            // 3. Listen for movements/updates
+            onChildChanged(playersRef, (snapshot) => {
+                const id = snapshot.key;
+                const data = snapshot.val();
+                if (id !== myId && players[id]) {
+                    // Store target for interpolation
+                    players[id].targetPos = new THREE.Vector3(data.x, data.y, data.z);
+                    players[id].targetRot = data.rot;
+                    
+                    // Check remote health change (did they get hit?)
+                    if (data.hp !== undefined) {
+                         // Optional: flash red if damaged
+                    }
+                }
+                
+                // If *I* was changed remotely (e.g. shot by someone else)
+                if (id === myId && data.hp < myHealth) {
+                    takeDamage(myHealth - data.hp);
+                }
+            });
+
+            // 4. Listen for disconnects
+            onChildRemoved(playersRef, (snapshot) => {
+                const id = snapshot.key;
+                if (players[id]) {
+                    scene.remove(players[id].mesh);
+                    delete players[id];
+                    logFeed(`${players[id].name || 'Enemy'} Left`);
+                }
+            });
+        }
+
+        function createRemotePlayer(id, data) {
+            // Visual Body
+            const group = new THREE.Group();
+            
+            const geo = new THREE.CapsuleGeometry(1, 2, 4, 8);
+            const mat = new THREE.MeshStandardMaterial({ color: 0xff0000 }); // Enemy Red
+            const mesh = new THREE.Mesh(geo, mat);
+            mesh.position.y = 2;
+            mesh.castShadow = true;
+            group.add(mesh);
+
+            // Floating Name
+            const canvas = document.createElement('canvas');
+            const context = canvas.getContext('2d');
+            canvas.width = 256; canvas.height = 64;
+            context.fillStyle = "white";
+            context.font = "Bold 30px Arial";
+            context.textAlign = "center";
+            context.fillText(data.name, 128, 40);
+            const texture = new THREE.CanvasTexture(canvas);
+            const spriteMat = new THREE.SpriteMaterial({ map: texture });
+            const sprite = new THREE.Sprite(spriteMat);
+            sprite.position.y = 4.5;
+            sprite.scale.set(4,1,1);
+            group.add(sprite);
+
+            scene.add(group);
+
+            players[id] = {
+                mesh: group,
+                name: data.name,
+                targetPos: new THREE.Vector3(data.x, data.y, data.z),
+                targetRot: data.rot
+            };
+            
+            logFeed(`${data.name} Joined`);
+        }
+
+        // --- 5. MOVEMENT & GAMEPLAY ---
+
+        function onKey(e, pressed) {
+            switch(e.code) {
+                case 'KeyW': moveState.fwd = pressed; break;
+                case 'KeyS': moveState.bwd = pressed; break;
+                case 'KeyA': moveState.left = pressed; break;
+                case 'KeyD': moveState.right = pressed; break;
+            }
+        }
+
+        function respawn() {
+            myHealth = 100;
+            updateHealthUI();
+            
+            // Random position inside arena
+            const rx = (Math.random() - 0.5) * 80;
+            const rz = (Math.random() - 0.5) * 80;
+            camera.position.set(rx, 2, rz);
+            
+            // Update DB immediately
+            updateMyState();
+        }
+
+        function updateMyState() {
+            if(!myId) return;
+            
+            // Push my data to Firebase
+            // NOTE: We round values to save bandwidth
+            set(ref(db, `games/${ROOM_ID}/players/${myId}`), {
+                name: myName,
+                x: Number(camera.position.x.toFixed(2)),
+                y: Number(camera.position.y.toFixed(2)),
+                z: Number(camera.position.z.toFixed(2)),
+                rot: Number(camera.position.y.toFixed(2)), // Storing yaw in Y
+                hp: myHealth
+            });
+        }
+
+        function shoot() {
+            // Visual
+            createLaser(camera.position, camera.getWorldDirection(new THREE.Vector3()));
+
+            // Raycasting logic
+            const raycaster = new THREE.Raycaster();
+            raycaster.setFromCamera(new THREE.Vector2(0, 0), camera);
+
+            // Check intersection with other players
+            const targets = [];
+            Object.keys(players).forEach(key => {
+                targets.push(players[key].mesh.children[0]); // The capsule mesh
+            });
+
+            const intersects = raycaster.intersectObjects(targets);
+
+            if (intersects.length > 0) {
+                const hitObject = intersects[0].object;
+                
+                // Find ID of hit player
+                let victimId = null;
+                Object.keys(players).forEach(key => {
+                    if (players[key].mesh.children.includes(hitObject)) {
+                        victimId = key;
+                    }
+                });
+
+                if (victimId) {
+                    // Update victim's health directly in Firebase (Client Authoritative)
+                    // We read current HP then subtract
+                    const victimRef = ref(db, `games/${ROOM_ID}/players/${victimId}/hp`);
+                    
+                    // Note: In a real app we'd use a Transaction, 
+                    // but for this simple demo, we just force an update assuming we hit.
+                    // However, we don't know their current exact HP locally without reading it.
+                    // For speed, let's just trigger a 'hit' event or simple decrement transaction.
+                    
+                    // Simple Transaction:
+                    // We assume standard damage 25
+                    // Note: This relies on the victim ID existing
+                    // Using transaction to atomically decrease health
+                    /* 
+                       Simplified approach for this code structure:
+                       We are not listening to every health change of enemies in 'players' object deeply enough.
+                       Let's just blindly update the specific field.
+                    */
+                   
+                   // Get snapshot of victim to confirm they are alive
+                   const vRef = ref(db, `games/${ROOM_ID}/players/${victimId}`);
+                   // For responsiveness we fire and forget the damage update 
+                   // (Better way: Cloud Function, but we can't use that here).
+                   
+                   // IMPORTANT: We cannot blindly decrement without current value.
+                   // Since we are syncing `players` via `onChildChanged`, we actually DO have their hp in the state implicitly if we stored it.
+                   // Let's assume we hit. We let the Victim handle their own death, OR we force it.
+                   // Let's Force it:
+                   
+                    // We just updated the 'hp' field in the DB. The victim listens to their own ID and dies locally.
+                    // Wait... we can't easily get their current HP instantly. 
+                    // Workaround: We decrement a specific "damage" counter or similar, 
+                    // BUT EASIEST: Just rely on visuals and "Honor system"? No, let's try transaction.
+                    
+                    // Re-fetch logic (slow but accurate)
+                    import('firebase/database').then(({ runTransaction }) => {
+                        runTransaction(vRef, (playerData) => {
+                            if (playerData && playerData.hp > 0) {
+                                playerData.hp -= 25;
+                                if (playerData.hp <= 0) {
+                                    // Kill logic if we want to log it here
+                                    // But typically victim handles respawn
+                                }
+                            }
+                            return playerData;
+                        });
+                    });
+                }
+            }
+        }
+
+        function takeDamage(dmg) {
+            myHealth -= dmg; 
+            // Correct the local HP if the server says it's different (handled by sync usually)
+            // But here we are just reacting to the difference.
+            
+            updateHealthUI();
+
+            if (myHealth <= 0) {
+                logFeed(`You Died!`);
+                camera.position.y = 50; // Spectator view briefly
+                
+                // Respawn timer
+                setTimeout(() => {
+                    respawn();
+                }, 3000);
+            }
+        }
+
+        function createLaser(origin, direction) {
+            const material = new THREE.LineBasicMaterial({ color: 0xffff00 });
+            const points = [];
+            points.push(new THREE.Vector3(origin.x + 0.5, origin.y - 0.5, origin.z)); // Offset right/down
+            points.push(new THREE.Vector3().copy(origin).add(direction.multiplyScalar(50)));
+            
+            const geometry = new THREE.BufferGeometry().setFromPoints(points);
+            const line = new THREE.Line(geometry, material);
+            scene.add(line);
+            
+            // Fade out
+            setTimeout(() => scene.remove(line), 100);
+        }
+
+        function updateHealthUI() {
+            const bar = document.getElementById('health-bar');
+            bar.style.width = Math.max(0, myHealth) + '%';
+            bar.style.backgroundColor = myHealth > 30 ? '#00ff00' : '#ff0000';
+        }
+
+        function logFeed(msg) {
+            const feed = document.getElementById('killfeed');
+            const div = document.createElement('div');
+            div.className = 'feed-msg';
+            div.innerText = msg;
+            feed.appendChild(div);
+            setTimeout(() => { div.style.opacity = 0; setTimeout(() => div.remove(), 1000); }, 3000);
+        }
+
+        // --- 6. RENDER LOOP ---
+        function animate() {
+            requestAnimationFrame(animate);
+
+            if (!myId) return;
+
+            const time = performance.now();
+            const delta = (time - lastUpdateTime) / 1000;
+
+            if (controls.isLocked && myHealth > 0) {
+                // Movement Logic
+                velocity.x -= velocity.x * 10.0 * delta; // Friction
+                velocity.z -= velocity.z * 10.0 * delta;
+
+                direction.z = Number(moveState.fwd) - Number(moveState.bwd);
+                direction.x = Number(moveState.right) - Number(moveState.left);
+                direction.normalize();
+
+                if (moveState.fwd || moveState.bwd) velocity.z -= direction.z * 400.0 * delta;
+                if (moveState.left || moveState.right) velocity.x -= direction.x * 400.0 * delta;
+
+                controls.moveRight(-velocity.x * delta);
+                controls.moveForward(-velocity.z * delta);
+            }
+
+            // Sync with Server (Throttled)
+            if (Date.now() - lastUpdateTime > UPDATE_RATE && myHealth > 0) {
+                updateMyState();
+                lastUpdateTime = Date.now();
+            }
+
+            // Interpolate Others
+            Object.values(players).forEach(p => {
+                if(p.targetPos) {
+                    p.mesh.position.lerp(p.targetPos, 0.2);
+                    // Simple rotation lerp
+                    // p.mesh.rotation.y = p.targetRot; (If we rotated the group)
+                    // The capsule doesn't rotate, but we can rotate the group or the sprite
+                }
+            });
+
+            renderer.render(scene, camera);
+        }
+
+        // Resize Handler
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+    </script>
+</body>
+</html>
